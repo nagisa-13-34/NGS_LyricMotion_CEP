@@ -1,0 +1,23 @@
+{
+  "name": "com.ngs.lyricmotion",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "postbuild": "copy CSInterface.js dist\\ && copy .debug dist\\ && if not exist dist\\CSXS mkdir dist\\CSXS && copy CSXS\\manifest.xml dist\\CSXS\\ && copy CSXS\\hostscript.jsx dist\\CSXS\\",
+    "deploy": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -Command \"$target=Join-Path $env:APPDATA 'Adobe\\\\CEP\\\\extensions\\\\com.ngs.lyricmotion'; $parent=Split-Path -Parent $target; if (!(Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }; if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }; Copy-Item -LiteralPath 'dist' -Destination $target -Recurse -Force\""
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.2.11"
+  }
+}
