@@ -225,7 +225,7 @@
     }
 
     // =================================================================
-    //  文字位置測定（シェイプ変換 → 各グループを分離して sourceRectAtTime）
+    //  文字位置測定（シェイプ変換 → パス頂点から正確なバウンディングボックスを計算）
     // =================================================================
 
     function measureCharPositions(comp, srcLayer, fullText, time, progressWin) {
@@ -235,7 +235,7 @@
         for (var i = 0; i < fullText.length; i++) {
             var c = fullText.charAt(i);
             if (c !== "\r" && c !== "\n" && c !== " " && c !== "\t" && c !== "\u3000") {
-                visibleChars.push(i);
+                visibleChars.push({ idx: i, ch: c });
             }
         }
 
@@ -275,45 +275,109 @@
             return null;
         }
 
-        var numGroups = contents.numProperties;
-        var measureCount = Math.min(numGroups, visibleChars.length);
+        // === パス頂点からバウンディングボックスを計算 ===
+        updateProgress(progressWin, 0.1, "\u30D1\u30B9\u9802\u70B9\u3092\u8AAD\u307F\u53D6\u308A\u4E2D...");
 
-        // 各グループを個別に分離して sourceRectAtTime で正確な位置を取得
-        var boundsMap = {};
+        var groupData = [];
+        for (var g = 1; g <= contents.numProperties; g++) {
+            var group = contents.property(g);
+            var groupName = group.name;
 
-        for (var g = 1; g <= measureCount; g++) {
-            updateProgress(progressWin, g / measureCount, "\u6E2C\u5B9A\u4E2D: " + g + "/" + measureCount);
-            // シェイプレイヤーを複製
-            var tmpLy = shapeLy.duplicate();
-            var tmpContents = tmpLy.property("ADBE Root Vectors Group");
+            // グループ内のTransform position
+            var gPos = [0, 0];
+            try {
+                var gTransform = group.property("ADBE Vector Transform Group");
+                if (gTransform) {
+                    gPos = gTransform.property("ADBE Vector Position").value;
+                }
+            } catch (e) {}
 
-            // 対象グループ以外を全部削除
-            // まず後ろから削除（g+1 以降）
-            while (tmpContents.numProperties > g) {
-                tmpContents.property(tmpContents.numProperties).remove();
+            // グループ内の全パスから頂点を読み取り
+            var groupContents = group.property("ADBE Vectors Group");
+            if (!groupContents) continue;
+
+            var minX = Infinity, maxX = -Infinity;
+            var minY = Infinity, maxY = -Infinity;
+
+            for (var p = 1; p <= groupContents.numProperties; p++) {
+                var prop = groupContents.property(p);
+                if (prop.matchName === "ADBE Vector Shape - Group") {
+                    try {
+                        var pathProp = prop.property("ADBE Vector Shape");
+                        if (pathProp) {
+                            var verts = pathProp.value.vertices;
+                            for (var v = 0; v < verts.length; v++) {
+                                var vx = verts[v][0] + gPos[0];
+                                var vy = verts[v][1] + gPos[1];
+                                if (vx < minX) minX = vx;
+                                if (vx > maxX) maxX = vx;
+                                if (vy < minY) minY = vy;
+                                if (vy > maxY) maxY = vy;
+                            }
+                        }
+                    } catch (e2) {}
+                }
             }
-            // 次に前から削除（index 1 を繰り返し削除して 1つになるまで）
-            while (tmpContents.numProperties > 1) {
-                tmpContents.property(1).remove();
+
+            if (minX !== Infinity) {
+                groupData.push({
+                    name: groupName,
+                    minX: minX, maxX: maxX,
+                    minY: minY, maxY: maxY
+                });
             }
 
-            // この1グループだけの sourceRect を取得
-            var rect = tmpLy.sourceRectAtTime(time, false);
-            tmpLy.remove();
-
-            if (rect.width > 0 || rect.height > 0) {
-                boundsMap[visibleChars[g - 1]] = {
-                    left: rect.left,
-                    top: rect.top,
-                    width: rect.width,
-                    height: rect.height
-                };
-            }
+            updateProgress(progressWin, 0.1 + 0.6 * (g / contents.numProperties),
+                "\u6E2C\u5B9A\u4E2D: " + g + "/" + contents.numProperties);
         }
 
         // 後始末
         shapeLy.remove();
         srcLayer.enabled = true;
+
+        // === グループ名で可視文字とマッチング → boundsMap構築 ===
+        updateProgress(progressWin, 0.8, "\u30DE\u30C3\u30C1\u30F3\u30B0\u4E2D...");
+
+        var boundsMap = {};
+        var usedGroups = {};
+
+        for (var ci = 0; ci < visibleChars.length; ci++) {
+            var ch = visibleChars[ci].ch;
+            var charIdx = visibleChars[ci].idx;
+            var merged = null;
+
+            for (var gi = 0; gi < groupData.length; gi++) {
+                if (usedGroups[gi]) continue;
+                if (groupData[gi].name === ch) {
+                    merged = {
+                        minX: groupData[gi].minX, maxX: groupData[gi].maxX,
+                        minY: groupData[gi].minY, maxY: groupData[gi].maxY
+                    };
+                    usedGroups[gi] = true;
+
+                    // 同じ名前の連続グループがあれば結合（複雑な漢字の分割対応）
+                    for (var gi2 = gi + 1; gi2 < groupData.length; gi2++) {
+                        if (usedGroups[gi2]) continue;
+                        if (groupData[gi2].name !== ch) break;
+                        merged.minX = Math.min(merged.minX, groupData[gi2].minX);
+                        merged.maxX = Math.max(merged.maxX, groupData[gi2].maxX);
+                        merged.minY = Math.min(merged.minY, groupData[gi2].minY);
+                        merged.maxY = Math.max(merged.maxY, groupData[gi2].maxY);
+                        usedGroups[gi2] = true;
+                    }
+                    break;
+                }
+            }
+
+            if (merged) {
+                boundsMap[charIdx] = {
+                    left: merged.minX,
+                    top: merged.minY,
+                    width: merged.maxX - merged.minX,
+                    height: merged.maxY - merged.minY
+                };
+            }
+        }
 
         return boundsMap;
     }

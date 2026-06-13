@@ -226,61 +226,27 @@ function NGS_LyricMotion_decomposeOne(textLayer, comp) {
     var textProp = textLayer.property("ADBE Text Properties").property("ADBE Text Document");
     var textDoc = textProp.value;
     var fullText = textDoc.text;
+    var time = comp.time;
 
-    // テキストを行に分割
-    var lines = fullText.split(/\r\n|\r|\n/);
-
-    // baselineLocsから各行のX範囲とベースラインYを取得
-    var baselineLocs = textDoc.baselineLocs;
-    if (!baselineLocs || baselineLocs.length < 4) return null;
-    var baseline0Y = baselineLocs[1]; // 1行目のベースラインY
-
-    var lineInfo = [];
-    for (var li = 0; li < lines.length; li++) {
-        var locIdx = li * 4;
-        if (locIdx + 3 < baselineLocs.length) {
-            var startX = baselineLocs[locIdx];
-            var startY = baselineLocs[locIdx + 1];
-            var endX = baselineLocs[locIdx + 2];
-            var lineLen = lines[li].length;
-            lineInfo.push({
-                startX: startX,
-                baselineY: startY,
-                charWidth: lineLen > 0 ? (endX - startX) / lineLen : 0
-            });
+    // 可視文字リスト
+    var visibleChars = [];
+    for (var i = 0; i < fullText.length; i++) {
+        var c = fullText.charAt(i);
+        if (c !== "\r" && c !== "\n" && c !== " " && c !== "\t" && c !== "\u3000") {
+            visibleChars.push({ ch: c, origIdx: i });
         }
     }
-
-    // 非空白文字リスト（行情報 + 元テキスト内インデックス付き）
-    var chars = [];
-    for (var li = 0; li < lines.length; li++) {
-        var line = lines[li];
-        for (var ci = 0; ci < line.length; ci++) {
-            var ch = line.charAt(ci);
-            if (ch === " " || ch === "\u3000" || ch === "\t") continue;
-            // 元テキスト内でのインデックスを計算
-            var origIdx = 0;
-            for (var pi = 0; pi < li; pi++) origIdx += lines[pi].length + 1; // +1 for newline
-            origIdx += ci;
-            chars.push({
-                ch: ch,
-                lineIdx: li,
-                posInLine: ci,
-                origIdx: origIdx
-            });
-        }
-    }
-    if (chars.length <= 1) {
-        if (chars.length === 1) NGS_LyricMotion_centerAnchor(textLayer, comp);
-        return chars.length === 1 ? [textLayer] : null;
+    if (visibleChars.length <= 1) {
+        if (visibleChars.length === 1) NGS_LyricMotion_centerAnchor(textLayer, comp);
+        return visibleChars.length === 1 ? [textLayer] : null;
     }
 
-    // 各文字のスタイル情報を記録（doc.text変更でスタイルがリセットされるため）
+    // 各文字のスタイル情報を記録
     var charStyles = [];
-    for (var ci = 0; ci < chars.length; ci++) {
+    for (var ci = 0; ci < visibleChars.length; ci++) {
         var style = null;
         try {
-            var range = textDoc.characterRange(chars[ci].origIdx, chars[ci].origIdx + 1);
+            var range = textDoc.characterRange(visibleChars[ci].origIdx, visibleChars[ci].origIdx + 1);
             style = {
                 fontSize: range.fontSize,
                 font: range.font,
@@ -295,28 +261,161 @@ function NGS_LyricMotion_decomposeOne(textLayer, comp) {
         charStyles.push(style);
     }
 
-    // 元テキストのトランスフォーム情報
-    var origAnchor = textLayer.anchorPoint.value;
-    var origPos = textLayer.position.value;
-    var origScale = textLayer.scale.value;
-    var origRot = textLayer.threeDLayer
+    // === Phase A: シェイプ変換 → パス頂点からバウンディングボックスを計算 ===
+    for (var si = 1; si <= comp.numLayers; si++) comp.layer(si).selected = false;
+    textLayer.selected = true;
+
+    var cmdId = app.findMenuCommandId("Create Shapes from Text");
+    if (cmdId === 0) cmdId = 3781;
+    app.executeCommand(cmdId);
+
+    var shapeLayer = comp.selectedLayers[0];
+    if (!shapeLayer || !(shapeLayer instanceof ShapeLayer)) return null;
+
+    var contents = shapeLayer.property("ADBE Root Vectors Group");
+    if (!contents) { shapeLayer.remove(); return null; }
+
+    // 各グループからパス頂点を読み取り、名前でグループ化
+    var charBounds = []; // visibleCharsと同じ順序で格納
+    var groupData = []; // {name, minX, maxX, minY, maxY}
+
+    for (var g = 1; g <= contents.numProperties; g++) {
+        var group = contents.property(g);
+        var groupName = group.name;
+
+        // グループ内のTransform position
+        var gPos = [0, 0];
+        try {
+            var gTransform = group.property("ADBE Vector Transform Group");
+            if (gTransform) {
+                gPos = gTransform.property("ADBE Vector Position").value;
+            }
+        } catch (e) {}
+
+        // グループ内の全パスから頂点を読み取り
+        var groupContents = group.property("ADBE Vectors Group");
+        if (!groupContents) continue;
+
+        var minX = Infinity, maxX = -Infinity;
+        var minY = Infinity, maxY = -Infinity;
+
+        for (var p = 1; p <= groupContents.numProperties; p++) {
+            var prop = groupContents.property(p);
+            if (prop.matchName === "ADBE Vector Shape - Group") {
+                try {
+                    var pathProp = prop.property("ADBE Vector Shape");
+                    if (pathProp) {
+                        var verts = pathProp.value.vertices;
+                        for (var v = 0; v < verts.length; v++) {
+                            var vx = verts[v][0] + gPos[0];
+                            var vy = verts[v][1] + gPos[1];
+                            if (vx < minX) minX = vx;
+                            if (vx > maxX) maxX = vx;
+                            if (vy < minY) minY = vy;
+                            if (vy > maxY) maxY = vy;
+                        }
+                    }
+                } catch (e2) {}
+            }
+        }
+
+        if (minX !== Infinity) {
+            groupData.push({
+                name: groupName,
+                minX: minX, maxX: maxX,
+                minY: minY, maxY: maxY
+            });
+        }
+    }
+
+    shapeLayer.remove();
+    textLayer.enabled = true;
+
+    // グループ名で可視文字とマッチング
+    // 同じ文字が複数回出現する場合は出現順でマッチ
+    var usedGroups = {};  // groupDataインデックス → 使用済みフラグ
+    for (var ci = 0; ci < visibleChars.length; ci++) {
+        var ch = visibleChars[ci].ch;
+        var merged = null;
+
+        // この文字に対応するグループを探す（未使用のものから順に）
+        for (var gi = 0; gi < groupData.length; gi++) {
+            if (usedGroups[gi]) continue;
+            if (groupData[gi].name === ch) {
+                // 最初にマッチしたグループ
+                merged = {
+                    minX: groupData[gi].minX, maxX: groupData[gi].maxX,
+                    minY: groupData[gi].minY, maxY: groupData[gi].maxY
+                };
+                usedGroups[gi] = true;
+
+                // 同じ名前の連続グループがあれば結合（複雑な漢字の分割対応）
+                for (var gi2 = gi + 1; gi2 < groupData.length; gi2++) {
+                    if (usedGroups[gi2]) continue;
+                    if (groupData[gi2].name !== ch) break;
+                    merged.minX = Math.min(merged.minX, groupData[gi2].minX);
+                    merged.maxX = Math.max(merged.maxX, groupData[gi2].maxX);
+                    merged.minY = Math.min(merged.minY, groupData[gi2].minY);
+                    merged.maxY = Math.max(merged.maxY, groupData[gi2].maxY);
+                    usedGroups[gi2] = true;
+                }
+                break;
+            }
+        }
+
+        if (merged) {
+            charBounds.push({
+                cx: (merged.minX + merged.maxX) / 2,
+                cy: (merged.minY + merged.maxY) / 2
+            });
+        } else {
+            // フォールバック: 前の文字の位置 + 1文字分オフセット
+            if (charBounds.length > 0) {
+                var prev = charBounds[charBounds.length - 1];
+                charBounds.push({ cx: prev.cx + 60, cy: prev.cy });
+            } else {
+                charBounds.push({ cx: 0, cy: 0 });
+            }
+        }
+    }
+
+    if (charBounds.length === 0) return null;
+
+    // === Phase B: delta計算でテキストレイヤーを配置 ===
+    var srcPos = textLayer.position.value;
+    var srcScale = textLayer.scale.value;
+    var srcRot = textLayer.threeDLayer
         ? textLayer.property("ADBE Transform Group").property("ADBE Rotate Z").value
         : textLayer.rotation.value;
-    var rad = origRot * Math.PI / 180;
+    var sxF = srcScale[0] / 100;
+    var syF = srcScale[1] / 100;
+    var rad = srcRot * Math.PI / 180;
     var cosR = Math.cos(rad);
     var sinR = Math.sin(rad);
-    var sx = origScale[0] / 100;
-    var sy = origScale[1] / 100;
 
-    // 文字ごとにテキストレイヤーを作成（逆順で作ってインデックス順を維持）
+    // 1文字テキストの基準位置を測定（パス頂点から）
+    // 一時シェイプで1文字のバウンディングボックス基準を取得
+    var tmpLayer = textLayer.duplicate();
+    var tmpTextProp = tmpLayer.property("ADBE Text Properties").property("ADBE Text Document");
+    var refDoc = tmpTextProp.value;
+    refDoc.text = visibleChars[0].ch;
+    tmpTextProp.setValue(refDoc);
+
+    // テキストの sourceRectAtTime から基準X中心を取得
+    var refRect = tmpLayer.sourceRectAtTime(time, false);
+    var refCX = refRect.left + refRect.width / 2;
+    var refCY = refRect.top + refRect.height / 2;
+    tmpLayer.remove();
+
     var resultLayers = [];
-    for (var j = chars.length - 1; j >= 0; j--) {
-        var charInfo = chars[j];
+    for (var j = visibleChars.length - 1; j >= 0; j--) {
+        var vChar = visibleChars[j];
+        var shapeBound = charBounds[j];
+
         var newLayer = textLayer.duplicate();
         var newTextProp = newLayer.property("ADBE Text Properties").property("ADBE Text Document");
         var doc = newTextProp.value;
-        doc.text = charInfo.ch;
-        // 元のスタイルを復元
+        doc.text = vChar.ch;
         if (charStyles[j]) {
             try {
                 doc.fontSize = charStyles[j].fontSize;
@@ -331,52 +430,49 @@ function NGS_LyricMotion_decomposeOne(textLayer, comp) {
         }
         newTextProp.setValue(doc);
 
-        // アンカーポイント = テキストインク中心
-        var singleRect = newLayer.sourceRectAtTime(comp.time, false);
-        var singleCX = singleRect.left + singleRect.width / 2;
-        var singleCY = singleRect.top + singleRect.height / 2;
-        newLayer.anchorPoint.setValue([singleCX, singleCY]);
+        // テキストの中心取得
+        var dupRect = newLayer.sourceRectAtTime(time, false);
+        var dupCX = dupRect.left + dupRect.width / 2;
+        var dupCY = dupRect.top + dupRect.height / 2;
 
-        // 1文字テキストのbaselineLocsからvisualOffsetを計算
-        // (advance width開始位置からビジュアル中心までのオフセット、文字揃えに依存しない)
-        var singleDoc2 = newTextProp.value;
-        var singleBL = singleDoc2.baselineLocs;
-        var singleStartX = (singleBL && singleBL.length >= 1) ? singleBL[0] : 0;
-        var visualOffset = singleCX - singleStartX;
+        // シェイプ中心（パス頂点ベース）とテキスト中心の差分
+        var dx = shapeBound.cx - dupCX;
+        var dy = shapeBound.cy - dupCY;
 
-        // baselineLocsから文字のローカル座標を計算
-        var li = charInfo.lineIdx;
-        var charCX, charCY;
-        if (li < lineInfo.length) {
-            var lInfo = lineInfo[li];
-            // X: 行内での位置 + 各文字固有のビジュアルオフセット
-            charCX = lInfo.startX + charInfo.posInLine * lInfo.charWidth + visualOffset;
-            // Y: 1文字テキストの中心 + 行ベースラインオフセット
-            charCY = singleCY + (lInfo.baselineY - baseline0Y);
-        } else {
-            charCX = singleCX;
-            charCY = singleCY;
-        }
+        // ワールド空間に変換
+        var worldDx = (dx * sxF) * cosR - (dy * syF) * sinR;
+        var worldDy = (dx * sxF) * sinR + (dy * syF) * cosR;
 
-        // 最終ポジション計算
-        var dlx = charCX - origAnchor[0];
-        var dly = charCY - origAnchor[1];
-        var finalPos = [
-            origPos[0] + dlx * sx * cosR - dly * sy * sinR,
-            origPos[1] + dlx * sx * sinR + dly * sy * cosR
-        ];
-        if (origPos.length > 2) finalPos[2] = origPos[2];
-        NGS_LyricMotion_setPosition(newLayer, finalPos);
+        var newPos = [srcPos[0] + worldDx, srcPos[1] + worldDy];
+        if (srcPos.length > 2) newPos[2] = srcPos[2];
+        NGS_LyricMotion_setPosition(newLayer, newPos);
 
-        newLayer.name = charInfo.ch;
+        newLayer.name = vChar.ch;
         newLayer.enabled = true;
         resultLayers.push(newLayer);
     }
 
     textLayer.enabled = false;
+
     return resultLayers;
 }
 
+
+// 分解のみ（モーション無し）テスト用
+function NGS_LyricMotion_decomposeOnly() {
+    var comp = app.project.activeItem;
+    if (!(comp && comp instanceof CompItem)) return "No comp";
+    var sel = comp.selectedLayers;
+    if (!sel || sel.length === 0) return "No selection";
+    var count = 0;
+    for (var i = 0; i < sel.length; i++) {
+        if (sel[i] instanceof TextLayer) {
+            var result = NGS_LyricMotion_decomposeOne(sel[i], comp);
+            if (result) count += result.length;
+        }
+    }
+    return "Decomposed: " + count + " chars";
+}
 
 function NGS_LyricMotion_apply(payload) {
     try {
