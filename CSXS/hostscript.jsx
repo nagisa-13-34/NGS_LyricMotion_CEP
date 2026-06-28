@@ -26,6 +26,131 @@ function NGS_LyricMotion_stringify(obj) {
     return "{" + parts.join(",") + "}";
 }
 
+function NGS_LyricMotion_getPresetFiles() {
+    var folder = new Folder(Folder.userData.fsName + "/NGS_LyricMotion");
+    return {
+        folder: folder,
+        target: new File(folder.fsName + "/presets.json"),
+        temporary: new File(folder.fsName + "/presets.json.tmp"),
+        backup: new File(folder.fsName + "/presets.json.bak")
+    };
+}
+
+function NGS_LyricMotion_readPresetStore() {
+    var files = NGS_LyricMotion_getPresetFiles();
+    var path = files.target.fsName;
+    if (!files.target.exists) {
+        return { ok: true, exists: false, path: path, presets: {} };
+    }
+
+    files.target.encoding = "UTF-8";
+    if (!files.target.open("r")) {
+        return { ok: false, error: "プリセットファイルを開けません: " + path, path: path };
+    }
+
+    var raw = "";
+    try {
+        raw = files.target.read();
+    } catch (eRead) {
+        return { ok: false, error: "プリセットファイルを読み込めません: " + path + "\n" + String(eRead), path: path };
+    } finally {
+        try { files.target.close(); } catch (eClose) {}
+    }
+
+    try {
+        if (raw.length > 0 && raw.charCodeAt(0) === 0xFEFF) raw = raw.substring(1);
+        var data = NGS_LyricMotion_parseJSON(raw);
+        if (!data || data.schemaVersion !== 1 || !data.presets || typeof data.presets !== "object") {
+            throw new Error("未対応のファイル形式です");
+        }
+        return { ok: true, exists: true, path: path, presets: data.presets };
+    } catch (eParse) {
+        return { ok: false, error: "プリセットファイルが壊れています: " + path + "\n" + String(eParse), path: path };
+    }
+}
+
+function NGS_LyricMotion_writePresetStore(presets) {
+    var files = NGS_LyricMotion_getPresetFiles();
+    var path = files.target.fsName;
+
+    if (!files.folder.exists && !files.folder.create()) {
+        return { ok: false, error: "プリセット保存フォルダーを作成できません: " + files.folder.fsName, path: path };
+    }
+
+    if (files.temporary.exists) {
+        try { files.temporary.remove(); } catch (eOldTemp) {}
+    }
+
+    files.temporary.encoding = "UTF-8";
+    files.temporary.lineFeed = "Unix";
+    if (!files.temporary.open("w")) {
+        return { ok: false, error: "プリセット一時ファイルを作成できません: " + files.temporary.fsName, path: path };
+    }
+
+    try {
+        files.temporary.write(NGS_LyricMotion_stringify({ schemaVersion: 1, presets: presets }));
+    } catch (eWrite) {
+        try { files.temporary.close(); } catch (eCloseTemp) {}
+        try { files.temporary.remove(); } catch (eRemoveTemp) {}
+        return { ok: false, error: "プリセットを保存できません: " + path + "\n" + String(eWrite), path: path };
+    }
+    files.temporary.close();
+
+    if (files.backup.exists) {
+        try { files.backup.remove(); } catch (eOldBackup) {}
+    }
+    if (files.target.exists) {
+        if (!files.target.copy(files.backup.fsName) || !files.target.remove()) {
+            try { files.temporary.remove(); } catch (eRemoveFailedTemp) {}
+            return { ok: false, error: "既存のプリセットファイルを置換できません: " + path, path: path };
+        }
+    }
+    if (!files.temporary.rename("presets.json")) {
+        if (files.backup.exists) files.backup.copy(path);
+        try { files.temporary.remove(); } catch (eRenameTemp) {}
+        return { ok: false, error: "プリセットファイルを確定できません: " + path, path: path };
+    }
+    if (files.backup.exists) {
+        try { files.backup.remove(); } catch (eRemoveBackup) {}
+    }
+
+    return { ok: true, exists: true, path: path, presets: presets };
+}
+
+function NGS_LyricMotion_loadPresets() {
+    return NGS_LyricMotion_stringify(NGS_LyricMotion_readPresetStore());
+}
+
+function NGS_LyricMotion_mutatePresets(payload) {
+    try {
+        var request = NGS_LyricMotion_parseJSON(payload);
+        var current = NGS_LyricMotion_readPresetStore();
+        if (!current.ok) return NGS_LyricMotion_stringify(current);
+
+        var presets = current.presets || {};
+        if (request.action === "migrate") {
+            var legacyPresets = request.presets || {};
+            for (var legacyName in legacyPresets) {
+                if (legacyPresets.hasOwnProperty(legacyName) && !presets.hasOwnProperty(legacyName)) {
+                    presets[legacyName] = legacyPresets[legacyName];
+                }
+            }
+        } else if (request.action === "upsert") {
+            var name = String(request.name || "").replace(/^\s+|\s+$/g, "");
+            if (!name) return NGS_LyricMotion_stringify({ ok: false, error: "プリセット名が空です", path: current.path });
+            presets[name] = request.settings;
+        } else if (request.action === "delete") {
+            if (presets.hasOwnProperty(request.name)) delete presets[request.name];
+        } else {
+            return NGS_LyricMotion_stringify({ ok: false, error: "不明なプリセット操作です", path: current.path });
+        }
+
+        return NGS_LyricMotion_stringify(NGS_LyricMotion_writePresetStore(presets));
+    } catch (e) {
+        return NGS_LyricMotion_stringify({ ok: false, error: "プリセット操作に失敗しました: " + String(e) });
+    }
+}
+
 function NGS_LyricMotion_num(value, fallback) {
     var n = parseFloat(value);
     return isNaN(n) ? fallback : n;

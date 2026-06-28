@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { CurveEditor } from './components/CurveEditor';
 import { escapeForExtendScript, evalAeScript } from './lib/cep';
+import { deletePreset, initializePresets, upsertPreset } from './lib/presets';
 import type { MotionSettings } from './lib/types';
 import './styles.css';
 
@@ -77,27 +78,32 @@ function NumberInput({
   );
 }
 
-const PRESETS_KEY = 'ngs_lyricmotion_presets';
-
-function loadPresets(): Record<string, MotionSettings> {
-  try {
-    const raw = localStorage.getItem(PRESETS_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch { return {}; }
-}
-
-function savePresets(presets: Record<string, MotionSettings>) {
-  localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
-}
-
 export default function App() {
   const [settings, setSettings] = useState<MotionSettings>(defaultSettings);
   const [status, setStatus] = useState('準備完了');
-  const [presets, setPresets] = useState(loadPresets);
+  const [presets, setPresets] = useState<Record<string, MotionSettings>>({});
   const [selectedPreset, setSelectedPreset] = useState('');
+  const [presetBusy, setPresetBusy] = useState(true);
   const [applying, setApplying] = useState(false);
   const [errorModal, setErrorModal] = useState<string | null>(null);
   const progressRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    initializePresets()
+      .then((loaded) => {
+        if (!cancelled) setPresets(loaded);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setErrorModal(error instanceof Error ? error.message : String(error));
+        setStatus('プリセット読込エラー');
+      })
+      .finally(() => {
+        if (!cancelled) setPresetBusy(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   const update = <K extends keyof MotionSettings>(key: K, value: MotionSettings[K]) => {
     setSettings((current) => ({ ...current, [key]: value }));
@@ -110,24 +116,39 @@ export default function App() {
     }
   };
 
-  const handleSavePreset = () => {
+  const handleSavePreset = async () => {
     const name = prompt('プリセット名を入力');
     if (!name || !name.trim()) return;
-    const next = { ...presets, [name.trim()]: { ...settings } };
-    setPresets(next);
-    savePresets(next);
-    setSelectedPreset(name.trim());
-    setStatus(`プリセット「${name.trim()}」を保存しました`);
+    const normalizedName = name.trim();
+    setPresetBusy(true);
+    try {
+      const next = await upsertPreset(normalizedName, { ...settings });
+      setPresets(next);
+      setSelectedPreset(normalizedName);
+      setStatus(`プリセット「${normalizedName}」を保存しました`);
+    } catch (error: unknown) {
+      setErrorModal(error instanceof Error ? error.message : String(error));
+      setStatus('プリセット保存エラー');
+    } finally {
+      setPresetBusy(false);
+    }
   };
 
-  const handleDeletePreset = () => {
+  const handleDeletePreset = async () => {
     if (!selectedPreset) return;
-    const next = { ...presets };
-    delete next[selectedPreset];
-    setPresets(next);
-    savePresets(next);
-    setStatus(`プリセット「${selectedPreset}」を削除しました`);
-    setSelectedPreset('');
+    const deletingName = selectedPreset;
+    setPresetBusy(true);
+    try {
+      const next = await deletePreset(deletingName);
+      setPresets(next);
+      setStatus(`プリセット「${deletingName}」を削除しました`);
+      setSelectedPreset('');
+    } catch (error: unknown) {
+      setErrorModal(error instanceof Error ? error.message : String(error));
+      setStatus('プリセット削除エラー');
+    } finally {
+      setPresetBusy(false);
+    }
   };
 
   const applyMotion = async () => {
@@ -169,11 +190,11 @@ export default function App() {
             <option key={name} value={name}>{name}</option>
           ))}
         </select>
-        <button className="preset-btn save" onClick={handleSavePreset} title="保存">保存</button>
+        <button className="preset-btn save" onClick={handleSavePreset} disabled={presetBusy} title="保存">保存</button>
         <button
           className="preset-btn danger"
           onClick={handleDeletePreset}
-          disabled={!selectedPreset}
+          disabled={!selectedPreset || presetBusy}
           title="削除"
         >×</button>
       </div>
