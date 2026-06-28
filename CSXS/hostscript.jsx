@@ -36,9 +36,13 @@ function NGS_LyricMotion_getPresetFiles() {
     };
 }
 
+function NGS_LyricMotion_transportText(value) {
+    return String(value).replace(/\\/g, "/");
+}
+
 function NGS_LyricMotion_readPresetStore() {
     var files = NGS_LyricMotion_getPresetFiles();
-    var path = files.target.fsName;
+    var path = NGS_LyricMotion_transportText(files.target.fsName);
     if (!files.target.exists) {
         return { ok: true, exists: false, path: path, presets: {} };
     }
@@ -52,7 +56,7 @@ function NGS_LyricMotion_readPresetStore() {
     try {
         raw = files.target.read();
     } catch (eRead) {
-        return { ok: false, error: "プリセットファイルを読み込めません: " + path + "\n" + String(eRead), path: path };
+        return { ok: false, error: "プリセットファイルを読み込めません: " + path + "\n" + NGS_LyricMotion_transportText(eRead), path: path };
     } finally {
         try { files.target.close(); } catch (eClose) {}
     }
@@ -65,16 +69,16 @@ function NGS_LyricMotion_readPresetStore() {
         }
         return { ok: true, exists: true, path: path, presets: data.presets };
     } catch (eParse) {
-        return { ok: false, error: "プリセットファイルが壊れています: " + path + "\n" + String(eParse), path: path };
+        return { ok: false, error: "プリセットファイルが壊れています: " + path + "\n" + NGS_LyricMotion_transportText(eParse), path: path };
     }
 }
 
 function NGS_LyricMotion_writePresetStore(presets) {
     var files = NGS_LyricMotion_getPresetFiles();
-    var path = files.target.fsName;
+    var path = NGS_LyricMotion_transportText(files.target.fsName);
 
     if (!files.folder.exists && !files.folder.create()) {
-        return { ok: false, error: "プリセット保存フォルダーを作成できません: " + files.folder.fsName, path: path };
+        return { ok: false, error: "プリセット保存フォルダーを作成できません: " + NGS_LyricMotion_transportText(files.folder.fsName), path: path };
     }
 
     if (files.temporary.exists) {
@@ -84,7 +88,7 @@ function NGS_LyricMotion_writePresetStore(presets) {
     files.temporary.encoding = "UTF-8";
     files.temporary.lineFeed = "Unix";
     if (!files.temporary.open("w")) {
-        return { ok: false, error: "プリセット一時ファイルを作成できません: " + files.temporary.fsName, path: path };
+        return { ok: false, error: "プリセット一時ファイルを作成できません: " + NGS_LyricMotion_transportText(files.temporary.fsName), path: path };
     }
 
     try {
@@ -92,7 +96,7 @@ function NGS_LyricMotion_writePresetStore(presets) {
     } catch (eWrite) {
         try { files.temporary.close(); } catch (eCloseTemp) {}
         try { files.temporary.remove(); } catch (eRemoveTemp) {}
-        return { ok: false, error: "プリセットを保存できません: " + path + "\n" + String(eWrite), path: path };
+        return { ok: false, error: "プリセットを保存できません: " + path + "\n" + NGS_LyricMotion_transportText(eWrite), path: path };
     }
     files.temporary.close();
 
@@ -147,7 +151,7 @@ function NGS_LyricMotion_mutatePresets(payload) {
 
         return NGS_LyricMotion_stringify(NGS_LyricMotion_writePresetStore(presets));
     } catch (e) {
-        return NGS_LyricMotion_stringify({ ok: false, error: "プリセット操作に失敗しました: " + String(e) });
+        return NGS_LyricMotion_stringify({ ok: false, error: "プリセット操作に失敗しました: " + NGS_LyricMotion_transportText(e) });
     }
 }
 
