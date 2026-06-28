@@ -47,10 +47,10 @@ function readLegacyPresets(): PresetMap {
 export async function initializePresets(): Promise<PresetMap> {
   const shared = parseResponse(await evalAeScript('NGS_LyricMotion_loadPresets()'));
   const legacy = readLegacyPresets();
-  if (Object.keys(legacy).length === 0) return shared.presets || {};
+  if (Object.keys(legacy).length === 0 && shared.exists) return shared.presets || {};
 
   const migrated = await mutatePresets({ action: 'migrate', presets: legacy });
-  localStorage.removeItem(LEGACY_PRESETS_KEY);
+  if (Object.keys(legacy).length > 0) localStorage.removeItem(LEGACY_PRESETS_KEY);
   return migrated.presets || {};
 }
 
