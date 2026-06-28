@@ -139,6 +139,7 @@ export default function App() {
     setApplying(false);
     try {
       const data = JSON.parse(result);
+      if (data.warning) setErrorModal(data.warning);
       if (data.error) {
         setErrorModal(data.error);
         setStatus('エラー');

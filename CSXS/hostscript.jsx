@@ -222,31 +222,90 @@ function NGS_LyricMotion_getPathBounds(group) {
     return { minX: minX, maxX: maxX, minY: minY, maxY: maxY };
 }
 
+function NGS_LyricMotion_removeEffects(layer) {
+    var effects = layer.property("ADBE Effect Parade");
+    if (!effects) return;
+    for (var i = effects.numProperties; i >= 1; i--) {
+        try { effects.property(i).remove(); } catch (e) {}
+    }
+}
+
+function NGS_LyricMotion_removeLayerQuietly(layer) {
+    if (!layer) return;
+    try { layer.remove(); } catch (e) {}
+}
+
+function NGS_LyricMotion_remapEffectLayerReferences(group, sourceLayer, outputLayer) {
+    if (!group) return 0;
+    var warnings = 0;
+
+    for (var i = 1; i <= group.numProperties; i++) {
+        var prop = group.property(i);
+        if (!prop) continue;
+
+        if (prop.propertyType === PropertyType.PROPERTY) {
+            if (prop.propertyValueType !== PropertyValueType.LAYER_INDEX) continue;
+
+            var hasExpression = false;
+            var expressionPointsToSource = false;
+            try {
+                hasExpression = prop.canSetExpression && prop.expressionEnabled;
+                expressionPointsToSource = hasExpression && prop.value === sourceLayer.index;
+            } catch (eExpression) {}
+
+            if (hasExpression) {
+                if (expressionPointsToSource) warnings++;
+                continue;
+            }
+
+            try {
+                if (prop.numKeys > 0) {
+                    for (var k = 1; k <= prop.numKeys; k++) {
+                        if (prop.keyValue(k) === sourceLayer.index) {
+                            prop.setValueAtKey(k, outputLayer.index);
+                        }
+                    }
+                } else if (prop.value === sourceLayer.index) {
+                    prop.setValue(outputLayer.index);
+                }
+            } catch (eValue) {}
+        } else {
+            warnings += NGS_LyricMotion_remapEffectLayerReferences(prop, sourceLayer, outputLayer);
+        }
+    }
+
+    return warnings;
+}
+
+var NGS_LyricMotion_lastDecomposeError = "";
+var NGS_LyricMotion_decomposeWarnings = 0;
+
 function NGS_LyricMotion_decomposeOne(textLayer, comp) {
+    NGS_LyricMotion_lastDecomposeError = "";
     var textProp = textLayer.property("ADBE Text Properties").property("ADBE Text Document");
     var textDoc = textProp.value;
     var fullText = textDoc.text;
     var time = comp.time;
-
-    // 可視文字リスト
     var visibleChars = [];
-    for (var i = 0; i < fullText.length; i++) {
+    var i;
+
+    for (i = 0; i < fullText.length; i++) {
         var c = fullText.charAt(i);
         if (c !== "\r" && c !== "\n" && c !== " " && c !== "\t" && c !== "\u3000") {
             visibleChars.push({ ch: c, origIdx: i });
         }
     }
+
     if (visibleChars.length <= 1) {
         if (visibleChars.length === 1) NGS_LyricMotion_centerAnchor(textLayer, comp);
         return visibleChars.length === 1 ? [textLayer] : null;
     }
 
-    // 各文字のスタイル情報を記録
     var charStyles = [];
-    for (var ci = 0; ci < visibleChars.length; ci++) {
+    for (i = 0; i < visibleChars.length; i++) {
         var style = null;
         try {
-            var range = textDoc.characterRange(visibleChars[ci].origIdx, visibleChars[ci].origIdx + 1);
+            var range = textDoc.characterRange(visibleChars[i].origIdx, visibleChars[i].origIdx + 1);
             style = {
                 fontSize: range.fontSize,
                 font: range.font,
@@ -257,131 +316,109 @@ function NGS_LyricMotion_decomposeOne(textLayer, comp) {
                 strokeWidth: range.strokeWidth,
                 tracking: range.tracking
             };
-        } catch (e) {}
+        } catch (eStyleRead) {}
         charStyles.push(style);
     }
 
-    // === Phase A: シェイプ変換 → パス頂点からバウンディングボックスを計算 ===
-    for (var si = 1; si <= comp.numLayers; si++) comp.layer(si).selected = false;
-    textLayer.selected = true;
+    var measureLayer = null;
+    var shapeLayer = null;
+    var groupData = [];
 
-    var cmdId = app.findMenuCommandId("Create Shapes from Text");
-    if (cmdId === 0) cmdId = 3781;
-    app.executeCommand(cmdId);
+    try {
+        measureLayer = textLayer.duplicate();
+        measureLayer.name = "__NGS_LyricMotion_Measure__";
+        measureLayer.enabled = true;
+        NGS_LyricMotion_removeEffects(measureLayer);
 
-    var shapeLayer = comp.selectedLayers[0];
-    if (!shapeLayer || !(shapeLayer instanceof ShapeLayer)) return null;
+        for (i = 1; i <= comp.numLayers; i++) comp.layer(i).selected = false;
+        measureLayer.selected = true;
 
-    var contents = shapeLayer.property("ADBE Root Vectors Group");
-    if (!contents) { shapeLayer.remove(); return null; }
+        var cmdId = app.findMenuCommandId("Create Shapes from Text");
+        if (cmdId === 0) cmdId = 3781;
+        app.executeCommand(cmdId);
 
-    // 各グループからパス頂点を読み取り、名前でグループ化
-    var charBounds = []; // visibleCharsと同じ順序で格納
-    var groupData = []; // {name, minX, maxX, minY, maxY}
-
-    for (var g = 1; g <= contents.numProperties; g++) {
-        var group = contents.property(g);
-        var groupName = group.name;
-
-        // グループ内のTransform position
-        var gPos = [0, 0];
-        try {
-            var gTransform = group.property("ADBE Vector Transform Group");
-            if (gTransform) {
-                gPos = gTransform.property("ADBE Vector Position").value;
-            }
-        } catch (e) {}
-
-        // グループ内の全パスから頂点を読み取り
-        var groupContents = group.property("ADBE Vectors Group");
-        if (!groupContents) continue;
-
-        var minX = Infinity, maxX = -Infinity;
-        var minY = Infinity, maxY = -Infinity;
-
-        for (var p = 1; p <= groupContents.numProperties; p++) {
-            var prop = groupContents.property(p);
-            if (prop.matchName === "ADBE Vector Shape - Group") {
-                try {
-                    var pathProp = prop.property("ADBE Vector Shape");
-                    if (pathProp) {
-                        var verts = pathProp.value.vertices;
-                        for (var v = 0; v < verts.length; v++) {
-                            var vx = verts[v][0] + gPos[0];
-                            var vy = verts[v][1] + gPos[1];
-                            if (vx < minX) minX = vx;
-                            if (vx > maxX) maxX = vx;
-                            if (vy < minY) minY = vy;
-                            if (vy > maxY) maxY = vy;
-                        }
-                    }
-                } catch (e2) {}
-            }
-        }
-
-        if (minX !== Infinity) {
-            groupData.push({
-                name: groupName,
-                minX: minX, maxX: maxX,
-                minY: minY, maxY: maxY
-            });
-        }
-    }
-
-    shapeLayer.remove();
-    textLayer.enabled = true;
-
-    // グループ名で可視文字とマッチング
-    // 同じ文字が複数回出現する場合は出現順でマッチ
-    var usedGroups = {};  // groupDataインデックス → 使用済みフラグ
-    for (var ci = 0; ci < visibleChars.length; ci++) {
-        var ch = visibleChars[ci].ch;
-        var merged = null;
-
-        // この文字に対応するグループを探す（未使用のものから順に）
-        for (var gi = 0; gi < groupData.length; gi++) {
-            if (usedGroups[gi]) continue;
-            if (groupData[gi].name === ch) {
-                // 最初にマッチしたグループ
-                merged = {
-                    minX: groupData[gi].minX, maxX: groupData[gi].maxX,
-                    minY: groupData[gi].minY, maxY: groupData[gi].maxY
-                };
-                usedGroups[gi] = true;
-
-                // 同じ名前の連続グループがあれば結合（複雑な漢字の分割対応）
-                for (var gi2 = gi + 1; gi2 < groupData.length; gi2++) {
-                    if (usedGroups[gi2]) continue;
-                    if (groupData[gi2].name !== ch) break;
-                    merged.minX = Math.min(merged.minX, groupData[gi2].minX);
-                    merged.maxX = Math.max(merged.maxX, groupData[gi2].maxX);
-                    merged.minY = Math.min(merged.minY, groupData[gi2].minY);
-                    merged.maxY = Math.max(merged.maxY, groupData[gi2].maxY);
-                    usedGroups[gi2] = true;
-                }
+        var selectedAfterConvert = comp.selectedLayers;
+        for (i = 0; i < selectedAfterConvert.length; i++) {
+            if (selectedAfterConvert[i] instanceof ShapeLayer) {
+                shapeLayer = selectedAfterConvert[i];
                 break;
             }
         }
+        if (!shapeLayer) throw new Error("文字アウトラインを作成できませんでした");
 
-        if (merged) {
-            charBounds.push({
-                cx: (merged.minX + merged.maxX) / 2,
-                cy: (merged.minY + merged.maxY) / 2
+        var contents = shapeLayer.property("ADBE Root Vectors Group");
+        if (!contents) throw new Error("文字アウトラインを読み取れませんでした");
+
+        for (var g = 1; g <= contents.numProperties; g++) {
+            var group = contents.property(g);
+            if (group.matchName !== "ADBE Vector Group") continue;
+
+            var bounds = NGS_LyricMotion_getPathBounds(group);
+            if (!bounds) continue;
+
+            var groupPos = [0, 0];
+            try {
+                var groupTransform = group.property("ADBE Vector Transform Group");
+                if (groupTransform) groupPos = groupTransform.property("ADBE Vector Position").value;
+            } catch (eGroupTransform) {}
+
+            groupData.push({
+                name: group.name,
+                minX: bounds.minX + groupPos[0],
+                maxX: bounds.maxX + groupPos[0],
+                minY: bounds.minY + groupPos[1],
+                maxY: bounds.maxY + groupPos[1]
             });
-        } else {
-            // フォールバック: 前の文字の位置 + 1文字分オフセット
-            if (charBounds.length > 0) {
-                var prev = charBounds[charBounds.length - 1];
-                charBounds.push({ cx: prev.cx + 60, cy: prev.cy });
-            } else {
-                charBounds.push({ cx: 0, cy: 0 });
-            }
         }
+    } catch (eMeasure) {
+        NGS_LyricMotion_lastDecomposeError = textLayer.name + ": " + String(eMeasure);
+        return null;
+    } finally {
+        NGS_LyricMotion_removeLayerQuietly(shapeLayer);
+        NGS_LyricMotion_removeLayerQuietly(measureLayer);
     }
 
-    if (charBounds.length === 0) return null;
+    if (groupData.length !== visibleChars.length) {
+        NGS_LyricMotion_lastDecomposeError = textLayer.name + ": 文字数とアウトライン数が一致しません (" + visibleChars.length + "/" + groupData.length + ")";
+        return null;
+    }
 
-    // === Phase B: delta計算でテキストレイヤーを配置 ===
+    var assignedGroups = [];
+    var usedGroups = {};
+    var ci;
+
+    for (ci = 0; ci < visibleChars.length; ci++) {
+        var matchedIndex = -1;
+        for (var gi = 0; gi < groupData.length; gi++) {
+            if (!usedGroups[gi] && groupData[gi].name === visibleChars[ci].ch) {
+                matchedIndex = gi;
+                break;
+            }
+        }
+        assignedGroups[ci] = matchedIndex;
+        if (matchedIndex >= 0) usedGroups[matchedIndex] = true;
+    }
+
+    var nextUnused = 0;
+    var charBounds = [];
+    for (ci = 0; ci < assignedGroups.length; ci++) {
+        if (assignedGroups[ci] < 0) {
+            while (nextUnused < groupData.length && usedGroups[nextUnused]) nextUnused++;
+            if (nextUnused >= groupData.length) {
+                NGS_LyricMotion_lastDecomposeError = textLayer.name + ": 文字アウトラインを対応付けできませんでした";
+                return null;
+            }
+            assignedGroups[ci] = nextUnused;
+            usedGroups[nextUnused] = true;
+        }
+
+        var assigned = groupData[assignedGroups[ci]];
+        charBounds.push({
+            cx: (assigned.minX + assigned.maxX) / 2,
+            cy: (assigned.minY + assigned.maxY) / 2
+        });
+    }
+
     var srcPos = textLayer.position.value;
     var srcScale = textLayer.scale.value;
     var srcRot = textLayer.threeDLayer
@@ -392,68 +429,59 @@ function NGS_LyricMotion_decomposeOne(textLayer, comp) {
     var rad = srcRot * Math.PI / 180;
     var cosR = Math.cos(rad);
     var sinR = Math.sin(rad);
-
-    // 1文字テキストの基準位置を測定（パス頂点から）
-    // 一時シェイプで1文字のバウンディングボックス基準を取得
-    var tmpLayer = textLayer.duplicate();
-    var tmpTextProp = tmpLayer.property("ADBE Text Properties").property("ADBE Text Document");
-    var refDoc = tmpTextProp.value;
-    refDoc.text = visibleChars[0].ch;
-    tmpTextProp.setValue(refDoc);
-
-    // テキストの sourceRectAtTime から基準X中心を取得
-    var refRect = tmpLayer.sourceRectAtTime(time, false);
-    var refCX = refRect.left + refRect.width / 2;
-    var refCY = refRect.top + refRect.height / 2;
-    tmpLayer.remove();
-
     var resultLayers = [];
-    for (var j = visibleChars.length - 1; j >= 0; j--) {
-        var vChar = visibleChars[j];
-        var shapeBound = charBounds[j];
 
-        var newLayer = textLayer.duplicate();
-        var newTextProp = newLayer.property("ADBE Text Properties").property("ADBE Text Document");
-        var doc = newTextProp.value;
-        doc.text = vChar.ch;
-        if (charStyles[j]) {
-            try {
-                doc.fontSize = charStyles[j].fontSize;
-                doc.font = charStyles[j].font;
-                doc.applyFill = charStyles[j].applyFill;
-                doc.fillColor = charStyles[j].fillColor;
-                doc.applyStroke = charStyles[j].applyStroke;
-                doc.strokeColor = charStyles[j].strokeColor;
-                doc.strokeWidth = charStyles[j].strokeWidth;
-                doc.tracking = charStyles[j].tracking;
-            } catch (eStyle) {}
+    try {
+        for (var j = visibleChars.length - 1; j >= 0; j--) {
+            var newLayer = textLayer.duplicate();
+            resultLayers.push(newLayer);
+
+            var newTextProp = newLayer.property("ADBE Text Properties").property("ADBE Text Document");
+            var doc = newTextProp.value;
+            doc.text = visibleChars[j].ch;
+            if (charStyles[j]) {
+                try {
+                    doc.fontSize = charStyles[j].fontSize;
+                    doc.font = charStyles[j].font;
+                    doc.applyFill = charStyles[j].applyFill;
+                    doc.fillColor = charStyles[j].fillColor;
+                    doc.applyStroke = charStyles[j].applyStroke;
+                    doc.strokeColor = charStyles[j].strokeColor;
+                    doc.strokeWidth = charStyles[j].strokeWidth;
+                    doc.tracking = charStyles[j].tracking;
+                } catch (eStyleWrite) {}
+            }
+            newTextProp.setValue(doc);
+
+            var dupRect = newLayer.sourceRectAtTime(time, false);
+            var dupCX = dupRect.left + dupRect.width / 2;
+            var dupCY = dupRect.top + dupRect.height / 2;
+            var dx = charBounds[j].cx - dupCX;
+            var dy = charBounds[j].cy - dupCY;
+            var worldDx = (dx * sxF) * cosR - (dy * syF) * sinR;
+            var worldDy = (dx * sxF) * sinR + (dy * syF) * cosR;
+            var newPos = [srcPos[0] + worldDx, srcPos[1] + worldDy];
+            if (srcPos.length > 2) newPos[2] = srcPos[2];
+
+            NGS_LyricMotion_setPosition(newLayer, newPos);
+            newLayer.name = visibleChars[j].ch;
+            newLayer.enabled = true;
         }
-        newTextProp.setValue(doc);
 
-        // テキストの中心取得
-        var dupRect = newLayer.sourceRectAtTime(time, false);
-        var dupCX = dupRect.left + dupRect.width / 2;
-        var dupCY = dupRect.top + dupRect.height / 2;
-
-        // シェイプ中心（パス頂点ベース）とテキスト中心の差分
-        var dx = shapeBound.cx - dupCX;
-        var dy = shapeBound.cy - dupCY;
-
-        // ワールド空間に変換
-        var worldDx = (dx * sxF) * cosR - (dy * syF) * sinR;
-        var worldDy = (dx * sxF) * sinR + (dy * syF) * cosR;
-
-        var newPos = [srcPos[0] + worldDx, srcPos[1] + worldDy];
-        if (srcPos.length > 2) newPos[2] = srcPos[2];
-        NGS_LyricMotion_setPosition(newLayer, newPos);
-
-        newLayer.name = vChar.ch;
-        newLayer.enabled = true;
-        resultLayers.push(newLayer);
+        for (var ri = 0; ri < resultLayers.length; ri++) {
+            NGS_LyricMotion_decomposeWarnings += NGS_LyricMotion_remapEffectLayerReferences(
+                resultLayers[ri].property("ADBE Effect Parade"),
+                textLayer,
+                resultLayers[ri]
+            );
+        }
+    } catch (eCreate) {
+        for (i = 0; i < resultLayers.length; i++) NGS_LyricMotion_removeLayerQuietly(resultLayers[i]);
+        NGS_LyricMotion_lastDecomposeError = textLayer.name + ": " + String(eCreate);
+        return null;
     }
 
     textLayer.enabled = false;
-
     return resultLayers;
 }
 
@@ -476,6 +504,8 @@ function NGS_LyricMotion_decomposeOnly() {
 
 function NGS_LyricMotion_apply(payload) {
     try {
+        NGS_LyricMotion_lastDecomposeError = "";
+        NGS_LyricMotion_decomposeWarnings = 0;
         var s = NGS_LyricMotion_parseJSON(payload);
         var comp = app.project.activeItem;
 
@@ -506,6 +536,9 @@ function NGS_LyricMotion_apply(payload) {
         }
 
         if (groups.length === 0) {
+            if (NGS_LyricMotion_lastDecomposeError) {
+                return NGS_LyricMotion_stringify({ error: NGS_LyricMotion_lastDecomposeError });
+            }
             return NGS_LyricMotion_stringify({ error: "分解できるレイヤーがないよ" });
         }
 
@@ -775,7 +808,14 @@ function NGS_LyricMotion_apply(payload) {
         }
         app.endUndoGroup();
 
-        return NGS_LyricMotion_stringify({ ok: true, count: processed });
+        return NGS_LyricMotion_stringify({
+            ok: true,
+            count: processed,
+            warnings: NGS_LyricMotion_decomposeWarnings,
+            warning: NGS_LyricMotion_decomposeWarnings > 0
+                ? "式で元レイヤーを参照しているエフェクト項目は変更していません"
+                : ""
+        });
     } catch (e) {
         try {
             app.endUndoGroup();
