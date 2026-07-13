@@ -409,6 +409,28 @@ function NGS_LyricMotion_remapEffectLayerReferences(group, sourceLayer, outputLa
 var NGS_LyricMotion_lastDecomposeError = "";
 var NGS_LyricMotion_decomposeWarnings = 0;
 
+function NGS_LyricMotion_orderCharacterGroups(visibleChars, groupData) {
+    if (visibleChars.length !== groupData.length) return null;
+
+    var forwardMatches = 0;
+    var reverseMatches = 0;
+    var lastIndex = groupData.length - 1;
+    var i;
+
+    for (i = 0; i < visibleChars.length; i++) {
+        if (groupData[i].name === visibleChars[i].ch) forwardMatches++;
+        if (groupData[lastIndex - i].name === visibleChars[i].ch) reverseMatches++;
+    }
+
+    var useReverseOrder = reverseMatches > forwardMatches;
+    var ordered = [];
+    for (i = 0; i < groupData.length; i++) {
+        ordered.push(groupData[useReverseOrder ? lastIndex - i : i]);
+    }
+
+    return ordered;
+}
+
 function NGS_LyricMotion_decomposeOne(textLayer, comp) {
     NGS_LyricMotion_lastDecomposeError = "";
     var textProp = textLayer.property("ADBE Text Properties").property("ADBE Text Document");
@@ -512,36 +534,15 @@ function NGS_LyricMotion_decomposeOne(textLayer, comp) {
         return null;
     }
 
-    var assignedGroups = [];
-    var usedGroups = {};
-    var ci;
-
-    for (ci = 0; ci < visibleChars.length; ci++) {
-        var matchedIndex = -1;
-        for (var gi = 0; gi < groupData.length; gi++) {
-            if (!usedGroups[gi] && groupData[gi].name === visibleChars[ci].ch) {
-                matchedIndex = gi;
-                break;
-            }
-        }
-        assignedGroups[ci] = matchedIndex;
-        if (matchedIndex >= 0) usedGroups[matchedIndex] = true;
+    var orderedGroups = NGS_LyricMotion_orderCharacterGroups(visibleChars, groupData);
+    if (!orderedGroups) {
+        NGS_LyricMotion_lastDecomposeError = textLayer.name + ": 文字アウトラインを対応付けできませんでした";
+        return null;
     }
 
-    var nextUnused = 0;
     var charBounds = [];
-    for (ci = 0; ci < assignedGroups.length; ci++) {
-        if (assignedGroups[ci] < 0) {
-            while (nextUnused < groupData.length && usedGroups[nextUnused]) nextUnused++;
-            if (nextUnused >= groupData.length) {
-                NGS_LyricMotion_lastDecomposeError = textLayer.name + ": 文字アウトラインを対応付けできませんでした";
-                return null;
-            }
-            assignedGroups[ci] = nextUnused;
-            usedGroups[nextUnused] = true;
-        }
-
-        var assigned = groupData[assignedGroups[ci]];
+    for (var ci = 0; ci < orderedGroups.length; ci++) {
+        var assigned = orderedGroups[ci];
         charBounds.push({
             cx: (assigned.minX + assigned.maxX) / 2,
             cy: (assigned.minY + assigned.maxY) / 2

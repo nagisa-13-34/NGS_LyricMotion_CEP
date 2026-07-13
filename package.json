@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test": "node tests/hostscript-logic.test.cjs",
     "build": "vite build",
     "postbuild": "copy CSInterface.js dist\\ && copy .debug dist\\ && if not exist dist\\CSXS mkdir dist\\CSXS && copy CSXS\\manifest.xml dist\\CSXS\\ && copy CSXS\\hostscript.jsx dist\\CSXS\\",
     "deploy": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -Command \"$target=Join-Path $env:APPDATA 'Adobe\\\\CEP\\\\extensions\\\\com.ngs.lyricmotion'; $parent=Split-Path -Parent $target; if (!(Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }; if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }; Copy-Item -LiteralPath 'dist' -Destination $target -Recurse -Force\""
